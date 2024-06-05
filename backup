@@ -1,0 +1,274 @@
+import cv2
+import RPi.GPIO as GPIO
+import threading
+import numpy as np
+import time
+import smbus
+ 
+# 定义GPIO引脚和PWM频率
+EA, I2, I1, EB, I4, I3 = (16, 21, 20, 13, 26, 19)
+FREQUENCY = 100
+ 
+# 设置GPIO模式
+GPIO.setmode(GPIO.BCM)
+GPIO.setup([EA, I2, I1, EB, I4, I3], GPIO.OUT)
+GPIO.output([EA, I2, EB, I3], GPIO.LOW)
+GPIO.output([I1, I4], GPIO.HIGH)
+ 
+# 初始化摄像头
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+ 
+# 设置I2C总线和超声波传感器地址
+bus = smbus.SMBus(1)
+address = 0x74
+wr_cmd = 0xb0  # 距离测量命令
+ 
+# 初始化PWM
+pwm_a = GPIO.PWM(EA, FREQUENCY)
+pwm_b = GPIO.PWM(EB, FREQUENCY)
+pwm_a.start(5)
+pwm_b.start(5)
+ 
+# 定义变量
+mid = 320
+DutyA, DutyB = 50, 50
+error = 0
+last_error = 0
+integral = 0
+area = 0
+cX = 0
+ 
+duty_max = 65
+duty_min = 55
+low_duty = 20
+high_duty = 50
+turning_coefficient = 0.0155
+ 
+time_data = []
+duty_a_data = []
+duty_b_data = []
+error_data = []
+ 
+# 定义颜色范围
+color_ranges = {
+    'green': (np.array([35, 80, 80]), np.array([85, 255, 255])),
+    'red': (np.array([0, 60, 60]), np.array([5, 255, 255])),
+    'orange': (np.array([10, 100, 100]), np.array([25, 255, 255])),
+    'blue': (np.array([100, 80, 80]), np.array([130, 255, 255])),
+    'yellow': (np.array([25, 80, 80]), np.array([35, 255, 255]))
+}
+ 
+# 限制占空比
+def duty_limit(duty):
+    return max(10, min(50, duty))
+ 
+distance = 100
+# 获取超声波传感器距离数据
+def get_distance():
+    global distance
+    try:
+        while True:
+            bus.write_byte_data(address, 0x2, wr_cmd)
+            time.sleep(0.1)  # 最小等待时间
+            HighByte = bus.read_byte_data(address, 0x2)
+            LowByte = bus.read_byte_data(address, 0x3)
+            Dist = (HighByte << 8) + LowByte
+            distance = Dist / 10.0
+            print(distance)
+    except Exception as e:
+        print("获取距离数据时发生异常:", e)
+ 
+# 获取图像处理误差
+def get_error(color, stop_event):
+    global cap, mid, error, area, cX
+    try:
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                continue
+           
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            lower, upper = color_ranges[color]
+            mask = cv2.inRange(hsv, lower, upper)
+            cv2.imshow("Mask", mask)
+            _,contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if len(contours) == 0:
+                continue
+           
+            largest_contour = max(contours, key=cv2.contourArea)
+            M = cv2.moments(largest_contour)
+            if M["m00"] == 0:
+                continue
+            cX = int(M["m10"] / M["m00"])
+            error = cX - mid
+            area = cv2.contourArea(largest_contour)
+            #print(area, cX, error)
+            if cv2.waitKey(1) == ord('q'):  # 按下‘q’键退出
+                break
+    except Exception as e:
+        print('获取误差时发生异常:', e)
+ 
+# 启动获取误差的线程
+def start_get_error_thread(color, stop_event):
+    t = threading.Thread(target=get_error, args=(color, stop_event))
+    t.daemon = True
+    t.start()
+    return t
+ 
+pre_dutyA = 50
+pre_dutyB = 50
+ 
+# 更新占空比
+def update_duty_a_and_duty_b(kp=0.15, ki=0.01, kd=0.1):
+    global error, DutyA, DutyB, last_error, integral, pre_dutyA, pre_dutyB
+    try:
+        derivative = (error - last_error) / 0.01
+        p_value = kp * error
+        i_value = ki * integral
+        d_value = kd * derivative
+        control_value = p_value + i_value + d_value
+ 
+        delta = control_value * turning_coefficient
+        DutyA = duty_limit(pre_dutyA + 0.3*delta)
+        DutyB = duty_limit(pre_dutyB - 0.3*delta)
+        print(delta)
+        pre_dutyA = DutyA
+        pre_dutyB = DutyB
+ 
+        last_error = error
+        integral += error * 0.01
+    except Exception as e:
+        print('更新占空比时发生异常:', e)
+       
+def findc():
+    global DutyA, DutyB, error
+    while abs(error) < 20:
+        if abs(error) < 20:
+            if error < 0:
+                DutyA = 30
+                DutyB = 0
+            else:
+                DutyA = 0
+                DutyB = 30
+            running()
+            time.sleep(0.1)
+           
+# 控制小车运行
+def running():
+    global DutyA, DutyB
+    pwm_a.ChangeDutyCycle(DutyA)
+    pwm_b.ChangeDutyCycle(DutyB)
+ 
+def stop():
+    pwm_a.ChangeDutyCycle(0)
+    pwm_b.ChangeDutyCycle(0)
+ 
+# 绕过障碍物的逻辑
+def turning(color):
+    global DutyA, DutyB, pre_dutyA, pre_dutyB
+    try:
+        if color == 'green':
+            tim = 0
+            while area > 10000:
+                DutyA = duty_limit(high_duty)
+                DutyB = duty_limit(low_duty)
+                running()
+                print('绕开障碍物')
+                time.sleep(0.03)
+                tim += 0.03
+                print(area)
+            print(tim,"s")
+            DutyA = duty_limit(high_duty)
+            DutyB = duty_limit(high_duty)
+            running()
+            time.sleep(0.8)
+            DutyA = duty_limit(low_duty)
+            DutyB = duty_limit(high_duty)
+            running()
+            print('返回')
+            time.sleep(tim + 0.8)
+            DutyA = duty_limit(high_duty)
+            DutyB = duty_limit(high_duty)
+            running()
+            time.sleep(0.1)
+            pre_dutyA = DutyA
+            pre_dutyB = DutyB
+ 
+        elif color =='red' or color == 'yellow' or color == 'blue' or color == 'orange':
+            tim = 0
+            while area > 9000:
+                DutyA = duty_limit(low_duty)
+                DutyB = duty_limit(high_duty)
+                running()
+                print('绕开障碍物')
+                time.sleep(0.03)
+                tim += 0.03
+            print(tim,"s")
+            DutyA = duty_limit(high_duty)
+            DutyB = duty_limit(high_duty)
+            running()
+            time.sleep(0.6)
+            DutyA = duty_limit(high_duty)
+            DutyB = duty_limit(low_duty)
+            running()
+            print('返回')
+            time.sleep(tim + 0.5)
+            DutyA = duty_limit(high_duty)
+            DutyB = duty_limit(high_duty)
+            running()
+            time.sleep(0.2)
+        else:
+            DutyA = duty_limit(high_duty)
+            DutyB = duty_limit(high_duty)
+            running()
+    except Exception as e:
+        print('绕障时发生异常:', e)
+ 
+# 启动获取距离数据的线程
+#th = threading.Thread(target=get_distance)
+#th.daemon = True
+#th.start()
+ 
+try:
+    colors = ['green', 'orange', 'green']
+    current_color_index = 0
+    stop_event = threading.Event()
+    current_thread = start_get_error_thread(colors[current_color_index], stop_event)
+ 
+    print("准备开始")
+    input()
+    while True:
+        print(colors[current_color_index])
+        findc()
+        while area < 20000:
+            findc()
+            update_duty_a_and_duty_b(kp=0.15, ki=0.01, kd=0.1)
+            running()
+            time.sleep(0.03)
+ 
+        if area and area > 20000:  # 假设面积大于20000像素点表示接近障碍物
+            turning(colors[current_color_index])
+ 
+            # 停止当前线程
+            stop_event.set()
+            current_thread.join()
+ 
+            # 切换到下一个颜色
+            current_color_index = (current_color_index + 1) % len(colors)
+            stop_event = threading.Event()
+            current_thread = start_get_error_thread(colors[current_color_index], stop_event)
+            print('切换到下一个颜色')
+ 
+except KeyboardInterrupt:
+    pass
+except Exception as e:
+    print('主循环中发生异常:', e)
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    bus.close()
+    GPIO.cleanup()
+ 
+ 
